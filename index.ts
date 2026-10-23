@@ -4,9 +4,10 @@
  * Derives omp's theme from the terminal's own palette so the TUI never drifts
  * from the theme it runs inside.
  *
- * Palette source (first match wins):
+ * Palette providers (first match wins):
  *   1. $OMP_TERMINAL_THEME_FILE  — a colors.toml or palette .json
- *   2. omarchy's live theme      — ~/.local/state/omarchy/current/theme/colors.toml
+ *   2. ghostty                   — `ghostty +show-config` (effective palette)
+ *   3. omarchy                   — ~/.local/state/omarchy/current/theme/colors.toml
  *
  * The palette is normalized to omp theme tokens (same surface blends omarchy
  * uses for its own themed configs) and written to <agentDir>/themes/omp.json.
@@ -36,9 +37,11 @@ const OMARCHY_CURRENT = path.join(
 	"omarchy",
 	"current",
 );
-const PALETTE_FILE = process.env.OMP_TERMINAL_THEME_FILE || path.join(OMARCHY_CURRENT, "theme", "colors.toml");
+const OMARCHY_PALETTE = path.join(OMARCHY_CURRENT, "theme", "colors.toml");
+const GHOSTTY_CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, ".config"), "ghostty");
 
 type Palette = Record<string, string>;
+type PaletteSource = { palette: Palette; label: string };
 
 /** Only the host surfaces this extension touches, so nothing is assumed beyond what it uses. */
 interface SessionContext {
@@ -95,7 +98,7 @@ function parseWithOmarchyThemeColor(file: string): Palette | undefined {
 	return Object.keys(palette).length > 0 ? palette : undefined;
 }
 
-function readPalette(file: string): Palette {
+function readPaletteFile(file: string): Palette {
 	const text = fs.readFileSync(file, "utf8");
 	if (!file.endsWith(".json")) return parseWithOmarchyThemeColor(file) ?? parseColorFile(text);
 
@@ -107,6 +110,52 @@ function readPalette(file: string): Palette {
 		}
 	}
 	return palette;
+}
+
+/**
+ * Read the palette the terminal actually resolved: ghostty merges its built-in
+ * defaults, `~/.config/ghostty/config` and every included file (omarchy's
+ * `ghostty.conf` is one), so this reflects overrides a theme manager never sees.
+ */
+function readGhosttyPalette(): Palette | undefined {
+	// Inside a Tern pane the visible surface is Tern's, not ghostty's.
+	if (process.env.TERM_PROGRAM === "tern") return undefined;
+	if (!process.env.GHOSTTY_RESOURCES_DIR && !process.env.GHOSTTY_BIN_DIR) return undefined;
+
+	const run = spawnSync("ghostty", ["+show-config"], { encoding: "utf8", timeout: 5000 });
+	if (run.error || run.status !== 0 || !run.stdout) return undefined;
+
+	const slots = new Map<number, string>();
+	let background: string | undefined;
+	let foreground: string | undefined;
+	for (const raw of run.stdout.split("\n")) {
+		const line = raw.trim();
+		const slot = /^palette = (\d+)=(#[0-9a-fA-F]{6})$/.exec(line);
+		if (slot) {
+			slots.set(Number(slot[1]), slot[2]!);
+			continue;
+		}
+		const base = /^(background|foreground) = (#[0-9a-fA-F]{6})$/.exec(line);
+		if (base) {
+			if (base[1] === "background") background = base[2];
+			else foreground = base[2];
+		}
+	}
+
+	const [red, green, yellow, blue, magenta, cyan] = [1, 2, 3, 4, 5, 6].map(index => slots.get(index));
+	if (!background || !foreground || !red || !green || !yellow || !blue || !magenta || !cyan) return undefined;
+	return { background, foreground, accent: blue, red, green, yellow, blue, magenta, cyan };
+}
+
+function resolvePalette(): PaletteSource | undefined {
+	const explicit = process.env.OMP_TERMINAL_THEME_FILE;
+	if (explicit) return fs.existsSync(explicit) ? { palette: readPaletteFile(explicit), label: explicit } : undefined;
+
+	const ghostty = readGhosttyPalette();
+	if (ghostty) return { palette: ghostty, label: "ghostty +show-config" };
+
+	if (fs.existsSync(OMARCHY_PALETTE)) return { palette: readPaletteFile(OMARCHY_PALETTE), label: OMARCHY_PALETTE };
+	return undefined;
 }
 
 /* ------------------------------------------------------------------- theme */
@@ -240,20 +289,31 @@ function buildTheme(palette: Palette) {
 type SyncResult = { status: "written" | "unchanged" | "skipped"; detail: string };
 
 function sync(): SyncResult {
-	if (!fs.existsSync(PALETTE_FILE)) return { status: "skipped", detail: `no palette at ${PALETTE_FILE}` };
+	const source = resolvePalette();
+	if (!source) {
+		const explicit = process.env.OMP_TERMINAL_THEME_FILE;
+		return { status: "skipped", detail: explicit ? `no palette at ${explicit}` : "no terminal palette found" };
+	}
 
-	const text = `${JSON.stringify(buildTheme(readPalette(PALETTE_FILE)), null, 2)}\n`;
+	const text = `${JSON.stringify(buildTheme(source.palette), null, 2)}\n`;
 	const previous = fs.existsSync(THEME_FILE) ? fs.readFileSync(THEME_FILE, "utf8") : undefined;
-	if (previous === text) return { status: "unchanged", detail: PALETTE_FILE };
+	if (previous === text) return { status: "unchanged", detail: source.label };
 
 	fs.mkdirSync(path.dirname(THEME_FILE), { recursive: true });
 	const temp = `${THEME_FILE}.${process.pid}.tmp`;
 	fs.writeFileSync(temp, text);
 	fs.renameSync(temp, THEME_FILE);
-	return { status: "written", detail: PALETTE_FILE };
+	return { status: "written", detail: source.label };
 }
 
 /* ---------------------------------------------------------------- watching */
+
+function watchDirectories(): string[] {
+	const dirs = new Set<string>([GHOSTTY_CONFIG_DIR, OMARCHY_CURRENT, path.join(OMARCHY_CURRENT, "theme")]);
+	const explicit = process.env.OMP_TERMINAL_THEME_FILE;
+	if (explicit) dirs.add(path.dirname(explicit));
+	return [...dirs];
+}
 
 class PaletteWatcher {
 	#watchers: fs.FSWatcher[] = [];
@@ -266,8 +326,7 @@ class PaletteWatcher {
 
 	start(): void {
 		this.stop();
-		const dirs = new Set([OMARCHY_CURRENT, path.dirname(PALETTE_FILE)]);
-		for (const dir of dirs) {
+		for (const dir of watchDirectories()) {
 			if (!fs.existsSync(dir)) continue;
 			try {
 				const watcher = fs.watch(dir, { persistent: false }, () => this.#schedule());

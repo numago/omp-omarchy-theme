@@ -31,20 +31,41 @@ theme:
   light: omp
 ```
 
-## Palette source
+## Where the colors come from
 
-First match wins:
+A theme manager does not paint the terminal — it writes the terminal's config,
+and the terminal resolves it. For ghostty under omarchy that chain is:
+
+```text
+omarchy theme → ~/.local/state/omarchy/current/theme/ghostty.conf (included)
+              → ghostty resolves defaults + config + includes
+              → the palette the pane actually shows
+```
+
+Reading only omarchy's `colors.toml` is one hop upstream: it misses local
+terminal overrides, non-omarchy setups, and other terminals. So the plugin asks
+the terminal first.
+
+Providers, first match wins:
 
 1. `$OMP_TERMINAL_THEME_FILE` — path to a `colors.toml` or a flat JSON object of
-   `#rrggbb` colors.
-2. omarchy's live theme — `~/.local/state/omarchy/current/theme/colors.toml`.
+   `#rrggbb` colors. Explicit wins over everything.
+2. **ghostty** — `ghostty +show-config`, i.e. the *effective* config after
+   defaults, `~/.config/ghostty/config` and every `config-file` include. Works
+   with or without omarchy, and picks up a manual `palette = …` override.
+3. **omarchy** — `~/.local/state/omarchy/current/theme/colors.toml`.
 
-Aliases (`colorN`, `bright_*`, derived shades) are resolved with
+Aliases (`colorN`, `bright_*`, derived shades) in provider 1/3 are resolved with
 `omarchy-theme-color --file … --all` when that binary is on `PATH`; otherwise the
 file is parsed in-process.
 
-The plugin reads a palette **file**; it does not query the terminal emulator with
-OSC. Any terminal theme that leaves a palette file behind works through
+Terminal palette → token mapping for providers 2: `background`/`foreground` →
+the terminal's own, `palette 1..6` → red/green/yellow/blue/magenta/cyan, and
+`accent` = palette 4 (blue), the slot omarchy also uses for its accent.
+
+The plugin reads a palette **file or the terminal's own config query**; it does
+not send OSC color queries, because omp owns the tty's input loop while the TUI
+runs. Any theme that leaves a palette file behind works through
 `OMP_TERMINAL_THEME_FILE`.
 
 ## What it derives
@@ -95,10 +116,16 @@ this plugin; it is a consumer of the theme this plugin produces.
 
 ## Limits
 
-- omarchy's palette path is the default; other setups set
-  `OMP_TERMINAL_THEME_FILE`.
+- Terminal-native discovery is ghostty-only today (`ghostty +show-config`). Other
+  terminals work through `OMP_TERMINAL_THEME_FILE`; adding a provider is one
+  function (kitty's `kitten @ get-colors`, wezterm, foot, …).
+- No OSC 4/10/11 queries: omp owns the tty's input loop while the TUI runs, so an
+  extension cannot safely read a terminal's reply. A `queryTerminalColors()` host
+  API would make every terminal work identically.
 - The generated theme file is refreshed while omp runs (or at the next session
   start), not by the terminal itself.
+- Inside a Tern pane the ghostty provider is skipped (Tern is the visible
+  surface); the omarchy/file providers still apply.
 
 ## Development
 
