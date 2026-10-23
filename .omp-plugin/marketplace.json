@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "omp themes derived from the terminal's own palette",
-    "version": "1.1.0"
+    "version": "1.2.0"
   },
   "plugins": [
     {
@@ -14,7 +14,7 @@
       "description": "Derive the omp TUI theme from the terminal palette and keep it in sync live.",
       "source": "./",
       "category": "development",
-      "version": "1.1.0",
+      "version": "1.2.0",
       "author": {
         "name": "Fred"
       },

@@ -4,15 +4,21 @@
  * Derives omp's theme from the terminal's own palette so the TUI never drifts
  * from the theme it runs inside.
  *
- * Palette providers (first match wins):
- *   1. $OMP_TERMINAL_THEME_FILE  — a colors.toml or palette .json
- *   2. ghostty                   — `ghostty +show-config` (effective palette)
- *   3. omarchy                   — ~/.local/state/omarchy/current/theme/colors.toml
+ * Modes ($OMP_TERMINAL_THEME_MODE):
+ *   auto (default) — exact palette when one is discoverable, else ANSI indices
+ *   hex            — exact palette only; do nothing when none is discoverable
+ *   indices        — always reference the terminal's own ANSI slots
+ *
+ * Exact-palette providers (first match wins):
+ *   1. $OMP_TERMINAL_THEME_FILE  — colors.toml / palette JSON / key=#rrggbb text
+ *   2. $OMP_TERMINAL_THEME_CMD   — any command whose stdout carries palette lines
+ *   3. kitty                     — `kitten @ get-colors`
+ *   4. ghostty                   — `ghostty +show-config` (effective palette)
+ *   5. omarchy                   — ~/.local/state/omarchy/current/theme/colors.toml
  *
  * The palette is normalized to omp theme tokens (same surface blends omarchy
  * uses for its own themed configs) and written to <agentDir>/themes/omp.json.
- * omp's theme watcher repaints a running TUI when that file changes, so a
- * terminal theme switch lands without a restart.
+ * omp's theme watcher repaints a running TUI when that file changes.
  */
 
 import * as fs from "node:fs";
@@ -41,7 +47,10 @@ const OMARCHY_PALETTE = path.join(OMARCHY_CURRENT, "theme", "colors.toml");
 const GHOSTTY_CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, ".config"), "ghostty");
 
 type Palette = Record<string, string>;
-type PaletteSource = { palette: Palette; label: string };
+type RawPalette = Record<string, string>;
+type Mode = "auto" | "hex" | "indices";
+type ProviderKind = "file" | "command" | "kitty" | "ghostty" | "omarchy";
+type PaletteSource = { palette: Palette; label: string; kind: ProviderKind };
 
 /** Only the host surfaces this extension touches, so nothing is assumed beyond what it uses. */
 interface SessionContext {
@@ -50,6 +59,11 @@ interface SessionContext {
 	ui?: { notify?(message: string, level?: "info" | "success" | "warn" | "error"): void };
 	setTimeout?(fn: () => void, ms: number): unknown;
 	clearTimer?(handle: unknown): void;
+}
+
+function themeMode(): Mode {
+	const raw = (process.env.OMP_TERMINAL_THEME_MODE ?? "auto").trim().toLowerCase();
+	return raw === "hex" || raw === "indices" ? raw : "auto";
 }
 
 /* ------------------------------------------------------------------ colors */
@@ -74,88 +88,135 @@ function mix(start: string, end: string, amount: number): string {
 
 /* ----------------------------------------------------------------- palette */
 
-function parseColorFile(text: string): Palette {
-	const palette: Palette = {};
-	for (const line of text.split(/\r?\n/)) {
-		const match = /^\s*([A-Za-z0-9_]+)\s*=\s*"?(#[0-9a-fA-F]{6})"?\s*(?:#.*)?$/.exec(line);
-		if (match) palette[match[1]!] = match[2]!;
+/**
+ * Tolerant reader for the line formats terminals and theme managers emit:
+ *   palette = 3=#459451     (ghostty)
+ *   color4 #509475          (kitty)
+ *   accent = "#509475"      (omarchy / TOML)
+ *   "blue": "#509475"       (JSON, via the JSON branch)
+ */
+function parsePaletteText(text: string): RawPalette {
+	const raw: RawPalette = {};
+	for (const rawLine of text.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line || line.startsWith("#") || line.startsWith("//")) continue;
+
+		const slot = /^palette\s*=\s*(\d+)\s*=\s*"?\s*#?([0-9a-fA-F]{6})"?$/.exec(line);
+		if (slot) {
+			raw[`palette${slot[1]}`] = `#${slot[2]!.toLowerCase()}`;
+			continue;
+		}
+
+		const pair = /^["']?([A-Za-z0-9_]+)["']?\s*(?:=|:|\s)\s*["']?\s*#?([0-9a-fA-F]{6})["']?\s*,?$/.exec(line);
+		if (pair) raw[pair[1]!.toLowerCase()] = `#${pair[2]!.toLowerCase()}`;
 	}
-	return palette;
+	return raw;
+}
+
+function parsePaletteJson(text: string): RawPalette {
+	const raw: RawPalette = {};
+	try {
+		const parsed: unknown = JSON.parse(text);
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
+		for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+			if (typeof value === "string" && parseHex(value)) raw[key.toLowerCase()] = value.toLowerCase();
+		}
+	} catch {
+		// Malformed JSON: treat it as text below by the caller's own parsing.
+	}
+	return raw;
+}
+
+/** Map a raw palette (any provider's vocabulary) onto the tokens this theme needs. */
+function semanticPalette(raw: RawPalette): Palette | undefined {
+	const pick = (...keys: string[]) => keys.map(key => raw[key]).find(value => value && parseHex(value));
+	const background = pick("background", "bg");
+	const foreground = pick("foreground", "fg");
+	const red = pick("red", "color1", "palette1");
+	const green = pick("green", "color2", "palette2");
+	const yellow = pick("yellow", "color3", "palette3");
+	const blue = pick("blue", "color4", "palette4");
+	const magenta = pick("magenta", "color5", "palette5");
+	const cyan = pick("cyan", "color6", "palette6");
+	if (!background || !foreground || !red || !green || !yellow || !blue || !magenta || !cyan) return undefined;
+	return {
+		background,
+		foreground,
+		accent: pick("accent") ?? blue,
+		red,
+		green,
+		yellow,
+		blue,
+		magenta,
+		cyan,
+	};
+}
+
+function readPaletteFile(file: string): Palette | undefined {
+	let text: string;
+	try {
+		text = fs.readFileSync(file, "utf8");
+	} catch {
+		return undefined;
+	}
+	const raw = file.endsWith(".json") ? { ...parsePaletteText(text), ...parsePaletteJson(text) } : parsePaletteText(text);
+	const missing = !raw.background || !raw.foreground;
+	// omarchy resolves aliases and derived shades for its own colors.toml.
+	const viaOmarchy = missing ? parseWithOmarchyThemeColor(file) : undefined;
+	return semanticPalette({ ...raw, ...viaOmarchy });
 }
 
 /**
  * omarchy-theme-color resolves color aliases (colorN, bright_*, derived shades)
- * exactly as omarchy itself does; prefer it when it is installed.
+ * exactly as omarchy itself does; prefer it for omarchy's colors.toml.
  */
-function parseWithOmarchyThemeColor(file: string): Palette | undefined {
+function parseWithOmarchyThemeColor(file: string): RawPalette | undefined {
 	const run = spawnSync("omarchy-theme-color", ["--file", file, "--all"], { encoding: "utf8", timeout: 5000 });
 	if (run.error || run.status !== 0 || !run.stdout) return undefined;
-	const palette: Palette = {};
-	for (const line of run.stdout.split("\n")) {
-		const [key, value] = line.split("\t");
-		if (key && value && parseHex(value)) palette[key.trim()] = value.trim();
-	}
-	return Object.keys(palette).length > 0 ? palette : undefined;
+	return parsePaletteText(run.stdout.replace(/\t/g, " "));
 }
 
-function readPaletteFile(file: string): Palette {
-	const text = fs.readFileSync(file, "utf8");
-	if (!file.endsWith(".json")) return parseWithOmarchyThemeColor(file) ?? parseColorFile(text);
-
-	const parsed: unknown = JSON.parse(text);
-	const palette: Palette = {};
-	if (parsed && typeof parsed === "object") {
-		for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
-			if (typeof value === "string" && parseHex(value)) palette[key] = value;
-		}
-	}
-	return palette;
-}
-
-/**
- * Read the palette the terminal actually resolved: ghostty merges its built-in
- * defaults, `~/.config/ghostty/config` and every included file (omarchy's
- * `ghostty.conf` is one), so this reflects overrides a theme manager never sees.
- */
-function readGhosttyPalette(): Palette | undefined {
-	// Inside a Tern pane the visible surface is Tern's, not ghostty's.
-	if (process.env.TERM_PROGRAM === "tern") return undefined;
-	if (!process.env.GHOSTTY_RESOURCES_DIR && !process.env.GHOSTTY_BIN_DIR) return undefined;
-
-	const run = spawnSync("ghostty", ["+show-config"], { encoding: "utf8", timeout: 5000 });
+function runPaletteCommand(command: string): RawPalette | undefined {
+	const run = spawnSync("sh", ["-c", command], { encoding: "utf8", timeout: 5000 });
 	if (run.error || run.status !== 0 || !run.stdout) return undefined;
-
-	const slots = new Map<number, string>();
-	let background: string | undefined;
-	let foreground: string | undefined;
-	for (const raw of run.stdout.split("\n")) {
-		const line = raw.trim();
-		const slot = /^palette = (\d+)=(#[0-9a-fA-F]{6})$/.exec(line);
-		if (slot) {
-			slots.set(Number(slot[1]), slot[2]!);
-			continue;
-		}
-		const base = /^(background|foreground) = (#[0-9a-fA-F]{6})$/.exec(line);
-		if (base) {
-			if (base[1] === "background") background = base[2];
-			else foreground = base[2];
-		}
-	}
-
-	const [red, green, yellow, blue, magenta, cyan] = [1, 2, 3, 4, 5, 6].map(index => slots.get(index));
-	if (!background || !foreground || !red || !green || !yellow || !blue || !magenta || !cyan) return undefined;
-	return { background, foreground, accent: blue, red, green, yellow, blue, magenta, cyan };
+	return parsePaletteText(run.stdout);
 }
 
-function resolvePalette(): PaletteSource | undefined {
-	const explicit = process.env.OMP_TERMINAL_THEME_FILE;
-	if (explicit) return fs.existsSync(explicit) ? { palette: readPaletteFile(explicit), label: explicit } : undefined;
+function providers(): PaletteSource[] {
+	const sources: PaletteSource[] = [];
 
-	const ghostty = readGhosttyPalette();
-	if (ghostty) return { palette: ghostty, label: "ghostty +show-config" };
+	const file = process.env.OMP_TERMINAL_THEME_FILE;
+	if (file) {
+		const palette = readPaletteFile(file);
+		if (palette) sources.push({ palette, label: file, kind: "file" });
+	}
 
-	if (fs.existsSync(OMARCHY_PALETTE)) return { palette: readPaletteFile(OMARCHY_PALETTE), label: OMARCHY_PALETTE };
-	return undefined;
+	const command = process.env.OMP_TERMINAL_THEME_CMD;
+	if (command) {
+		const raw = runPaletteCommand(command);
+		const palette = raw && semanticPalette(raw);
+		if (palette) sources.push({ palette, label: `$OMP_TERMINAL_THEME_CMD (${command})`, kind: "command" });
+	}
+
+	if (process.env.KITTY_WINDOW_ID) {
+		const raw = runPaletteCommand("kitten @ get-colors");
+		const palette = raw && semanticPalette(raw);
+		if (palette) sources.push({ palette, label: "kitten @ get-colors", kind: "kitty" });
+	}
+
+	// Inside a Tern pane the visible surface is Tern's, so ghostty's config is not it.
+	if (process.env.TERM_PROGRAM !== "tern" && (process.env.GHOSTTY_RESOURCES_DIR || process.env.GHOSTTY_BIN_DIR)) {
+		const raw = runPaletteCommand("ghostty +show-config");
+		const palette = raw && semanticPalette(raw);
+		if (palette) sources.push({ palette, label: "ghostty +show-config", kind: "ghostty" });
+	}
+
+	if (fs.existsSync(OMARCHY_PALETTE)) {
+		const palette = readPaletteFile(OMARCHY_PALETTE);
+		if (palette) sources.push({ palette, label: OMARCHY_PALETTE, kind: "omarchy" });
+	}
+
+	return sources;
 }
 
 /* ------------------------------------------------------------------- theme */
@@ -286,32 +347,140 @@ function buildTheme(palette: Palette) {
 	};
 }
 
-type SyncResult = { status: "written" | "unchanged" | "skipped"; detail: string };
+/**
+ * Emulator-agnostic theme: every token is an ANSI slot index, resolved by the
+ * terminal itself. No palette is read, so it cannot drift — but surfaces cannot
+ * be derived, and consumers that need hex (Tern's native surface, HTML export)
+ * receive omp's fixed xterm values for those slots.
+ */
+function buildIndexTheme() {
+	return {
+		$schema: SCHEMA_URL,
+		name: THEME_NAME,
+		colors: {
+			accent: 4,
+			border: 8,
+			borderAccent: 4,
+			borderMuted: 8,
+			success: 2,
+			error: 1,
+			warning: 3,
+			muted: 8,
+			dim: 8,
+			text: "",
+			thinkingText: 8,
+
+			selectedBg: 8,
+			userMessageBg: "",
+			userMessageText: "",
+			customMessageBg: "",
+			customMessageText: "",
+			customMessageLabel: 6,
+			toolPendingBg: "",
+			toolSuccessBg: "",
+			toolErrorBg: "",
+			toolTitle: 4,
+			toolOutput: "",
+
+			mdHeading: 5,
+			mdLink: 4,
+			mdLinkUrl: 6,
+			mdCode: 6,
+			mdCodeBlock: "",
+			mdCodeBlockBorder: 7,
+			mdQuote: 8,
+			mdQuoteBorder: 8,
+			mdHr: 8,
+			mdListBullet: 6,
+
+			toolDiffAdded: 2,
+			toolDiffRemoved: 1,
+			toolDiffContext: 8,
+
+			syntaxComment: 8,
+			syntaxKeyword: 5,
+			syntaxFunction: 4,
+			syntaxVariable: "",
+			syntaxString: 2,
+			syntaxNumber: 3,
+			syntaxType: 6,
+			syntaxOperator: 5,
+			syntaxPunctuation: 8,
+
+			thinkingOff: 8,
+			thinkingMinimal: 8,
+			thinkingLow: 4,
+			thinkingMedium: 5,
+			thinkingHigh: 3,
+			thinkingXhigh: 1,
+
+			bashMode: 2,
+			pythonMode: 3,
+
+			statusLineBg: "",
+			statusLineSep: 8,
+			statusLineModel: 5,
+			statusLinePath: 7,
+			statusLineGitClean: 2,
+			statusLineGitDirty: 3,
+			statusLineContext: 6,
+			statusLineSpend: 3,
+			statusLineStaged: 2,
+			statusLineDirty: 3,
+			statusLineUntracked: 1,
+			statusLineOutput: 4,
+			statusLineCost: 3,
+			statusLineSubagents: 5,
+		},
+		export: {},
+	};
+}
+
+type Resolved = { theme: object; label: string; watch: boolean };
+type SyncResult = { status: "written" | "unchanged" | "skipped"; detail: string; watch: boolean };
+
+function resolveTheme(): Resolved | undefined {
+	const mode = themeMode();
+	const sources = mode === "indices" ? [] : providers();
+	const source = sources[0];
+	if (source) {
+		return {
+			theme: buildTheme(source.palette),
+			label: source.label,
+			watch: source.kind === "file" || source.kind === "ghostty" || source.kind === "omarchy",
+		};
+	}
+	if (mode === "hex") return undefined;
+	return {
+		theme: buildIndexTheme(),
+		label: mode === "indices" ? "ANSI palette indices" : "ANSI palette indices (no exact palette source)",
+		watch: false,
+	};
+}
 
 function sync(): SyncResult {
-	const source = resolvePalette();
-	if (!source) {
-		const explicit = process.env.OMP_TERMINAL_THEME_FILE;
-		return { status: "skipped", detail: explicit ? `no palette at ${explicit}` : "no terminal palette found" };
+	const resolved = resolveTheme();
+	if (!resolved) {
+		return { status: "skipped", detail: "no terminal palette found and mode=hex", watch: false };
 	}
 
-	const text = `${JSON.stringify(buildTheme(source.palette), null, 2)}\n`;
+	const text = `${JSON.stringify(resolved.theme, null, 2)}\n`;
 	const previous = fs.existsSync(THEME_FILE) ? fs.readFileSync(THEME_FILE, "utf8") : undefined;
-	if (previous === text) return { status: "unchanged", detail: source.label };
+	if (previous === text) return { status: "unchanged", detail: resolved.label, watch: resolved.watch };
 
 	fs.mkdirSync(path.dirname(THEME_FILE), { recursive: true });
 	const temp = `${THEME_FILE}.${process.pid}.tmp`;
 	fs.writeFileSync(temp, text);
 	fs.renameSync(temp, THEME_FILE);
-	return { status: "written", detail: source.label };
+	return { status: "written", detail: resolved.label, watch: resolved.watch };
 }
 
 /* ---------------------------------------------------------------- watching */
 
 function watchDirectories(): string[] {
 	const dirs = new Set<string>([GHOSTTY_CONFIG_DIR, OMARCHY_CURRENT, path.join(OMARCHY_CURRENT, "theme")]);
-	const explicit = process.env.OMP_TERMINAL_THEME_FILE;
-	if (explicit) dirs.add(path.dirname(explicit));
+	const file = process.env.OMP_TERMINAL_THEME_FILE;
+	if (file) dirs.add(path.dirname(file));
 	return [...dirs];
 }
 
@@ -364,7 +533,7 @@ class PaletteWatcher {
 				if (getCurrentThemeName() !== THEME_NAME) return;
 				void setTheme(THEME_NAME, true);
 			} catch (error) {
-				this.#ctx.ui?.notify?.(`omarchy theme: ${String(error)}`, "warn");
+				this.#ctx.ui?.notify?.(`terminal theme: ${String(error)}`, "warn");
 			}
 		}, DEBOUNCE_MS);
 	}
@@ -389,8 +558,8 @@ function optIn(pi: ExtensionAPI): boolean {
 	}
 }
 
-export default function omarchyTheme(pi: ExtensionAPI) {
-	pi.setLabel("Omarchy Theme");
+export default function terminalTheme(pi: ExtensionAPI) {
+	pi.setLabel("Terminal Theme");
 	let watcher: PaletteWatcher | undefined;
 
 	pi.on("session_start", async (_event: unknown, ctx: SessionContext) => {
@@ -400,7 +569,7 @@ export default function omarchyTheme(pi: ExtensionAPI) {
 		try {
 			result = sync();
 		} catch (error) {
-			ctx.ui?.notify?.(`omarchy theme: ${String(error)}`, "warn");
+			ctx.ui?.notify?.(`terminal theme: ${String(error)}`, "warn");
 			return;
 		}
 		if (result.status === "skipped" || !optIn(pi)) return;
@@ -408,12 +577,12 @@ export default function omarchyTheme(pi: ExtensionAPI) {
 		if (getCurrentThemeName() !== THEME_NAME) {
 			const applied = await setTheme(THEME_NAME, true);
 			if (!applied.success) {
-				ctx.ui?.notify?.(`omarchy theme: ${applied.error ?? "theme switch failed"}`, "warn");
+				ctx.ui?.notify?.(`terminal theme: ${applied.error ?? "theme switch failed"}`, "warn");
 				return;
 			}
 		}
 
-		if (ctx.mode === "tui") {
+		if (ctx.mode === "tui" && result.watch) {
 			watcher = new PaletteWatcher(ctx);
 			watcher.start();
 		}
@@ -426,22 +595,22 @@ export default function omarchyTheme(pi: ExtensionAPI) {
 
 	pi.registerCommand("theme-sync", {
 		description: "Re-derive the omp theme from the terminal palette",
-		handler: async (_args: unknown, ctx: SessionContext & { ui?: SessionContext["ui"] }) => {
+		handler: async (_args: unknown, ctx: SessionContext) => {
 			try {
 				const result = sync();
 				if (result.status === "skipped") {
-					ctx.ui?.notify?.(`omarchy theme: ${result.detail}`, "warn");
+					ctx.ui?.notify?.(`terminal theme: ${result.detail}`, "warn");
 					return;
 				}
 				const applied = await setTheme(THEME_NAME, true);
 				ctx.ui?.notify?.(
 					applied.success
-						? `omarchy theme: ${result.status} from ${result.detail}`
-						: `omarchy theme: ${applied.error ?? "theme switch failed"}`,
+						? `terminal theme: ${result.status} from ${result.detail}`
+						: `terminal theme: ${applied.error ?? "theme switch failed"}`,
 					applied.success && result.status === "written" ? "success" : applied.success ? "info" : "error",
 				);
 			} catch (error) {
-				ctx.ui?.notify?.(`omarchy theme: ${String(error)}`, "error");
+				ctx.ui?.notify?.(`terminal theme: ${String(error)}`, "error");
 			}
 		},
 	});
