@@ -16,7 +16,7 @@ omp plugin install github:numago/omp-omarchy-theme
 
 # or as a marketplace source
 omp plugin marketplace add numago/omp-omarchy-theme
-omp plugin install omp-omarchy-theme@omp-omarchy-theme
+omp plugin install omp-omarchy-theme@numago
 
 # or from a local checkout
 omp plugin install ~/path/to/omp-omarchy-theme

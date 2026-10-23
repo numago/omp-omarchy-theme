@@ -1,6 +1,6 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "omp-omarchy-theme",
+  "name": "numago",
   "owner": {
     "name": "Fred"
   },
@@ -21,8 +21,18 @@
       "homepage": "https://github.com/numago/omp-omarchy-theme",
       "repository": "https://github.com/numago/omp-omarchy-theme",
       "license": "MIT",
-      "keywords": ["omp", "oh-my-pi", "omarchy", "theme", "terminal"],
-      "tags": ["theme", "terminal", "omarchy"]
+      "keywords": [
+        "omp",
+        "oh-my-pi",
+        "omarchy",
+        "theme",
+        "terminal"
+      ],
+      "tags": [
+        "theme",
+        "terminal",
+        "omarchy"
+      ]
     }
   ]
 }
