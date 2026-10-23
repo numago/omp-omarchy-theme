@@ -1,0 +1,28 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "omp-omarchy-theme",
+  "owner": {
+    "name": "Fred"
+  },
+  "metadata": {
+    "description": "omp themes derived from the terminal's own palette",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "omp-omarchy-theme",
+      "description": "Derive the omp TUI theme from the terminal palette and keep it in sync live.",
+      "source": "./",
+      "category": "development",
+      "version": "1.0.0",
+      "author": {
+        "name": "Fred"
+      },
+      "homepage": "https://github.com/numago/omp-omarchy-theme",
+      "repository": "https://github.com/numago/omp-omarchy-theme",
+      "license": "MIT",
+      "keywords": ["omp", "oh-my-pi", "omarchy", "theme", "terminal"],
+      "tags": ["theme", "terminal", "omarchy"]
+    }
+  ]
+}

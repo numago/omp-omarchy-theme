@@ -1,0 +1,23 @@
+{
+  "name": "omp-omarchy-theme",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Derive the omp (oh-my-pi) TUI theme from the terminal's own palette and keep it in sync live.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/numago/omp-omarchy-theme.git"
+  },
+  "homepage": "https://github.com/numago/omp-omarchy-theme",
+  "keywords": [
+    "omp",
+    "oh-my-pi",
+    "omarchy",
+    "theme",
+    "terminal",
+    "extension"
+  ],
+  "omp": {
+    "extensions": ["./index.ts"]
+  }
+}
