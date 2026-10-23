@@ -1,8 +1,8 @@
 {
   "name": "omp-omarchy-theme",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
-  "description": "Derive the omp (oh-my-pi) TUI theme from the terminal's own palette and keep it in sync live.",
+  "description": "Derive the omp TUI theme from the palette that feeds the terminal (omarchy, or an explicit palette file) and keep it in sync live.",
   "license": "MIT",
   "repository": {
     "type": "git",
